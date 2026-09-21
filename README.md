@@ -40,6 +40,13 @@ form can teach the agent to submit *all* of them.
 4. ✨ **Create.** From an approved analysis, generate a reusable **Skill** and/or a
    scheduled **Automation**.
 
+For skills, **Review SKILL.md** optionally shows the complete, read-only file text
+(including frontmatter) before installation or export. Preparing a preview writes
+no skill files. Close and reopen it without regenerating; Add/Export from either
+surface uses that exact preview. Editing the plan discards the preview. You can
+still choose Add/Export directly without reviewing or adding a confirmation step.
+Review provides visibility into the generated instructions, not a security guarantee.
+
 ## Get started
 
 Skill Recorder is published as a **source release**: one command downloads a pinned Node.js

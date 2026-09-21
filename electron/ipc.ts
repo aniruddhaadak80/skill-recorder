@@ -26,6 +26,7 @@ import type {
   SkillCreateResult,
   SkillPlacement,
   SkillPlanResult,
+  SkillPreviewResult,
 } from "../common/ipc";
 import { IPC } from "../common/ipc";
 import type { AutomationPlan } from "../common/automation";
@@ -52,7 +53,7 @@ import {
 import type { SensitiveModelManager } from "./sensitive/model-manager";
 import { buildRedactor, loadSensitiveReport, saveSensitiveReport, scanSession } from "./sensitive/scanner";
 import { deleteSession, listSessions } from "./sessions";
-import { loadPersistedSkill, SkillBuilder, type SkillTarget } from "./skillbuilder/builder";
+import { loadPersistedSkill, SkillBuilder, SkillPreviewExpiredError, type SkillTarget } from "./skillbuilder/builder";
 
 const log = createLogger("IPC");
 
@@ -429,17 +430,47 @@ export function registerIpc(
   });
 
   ipcMain.handle(
+    IPC.prepareSkill,
+    async (_event, sessionId: string, plan: SkillPlan): Promise<SkillPreviewResult> => {
+      if (!isValidSessionId(sessionId)) return { ok: false, error: "Unknown session." };
+      try {
+        return { ok: true, preview: await builder.prepare(sessionId, plan) };
+      } catch (err) {
+        const error = err instanceof Error ? err.message : String(err);
+        log.warn("prepare skill failed:", error);
+        return { ok: false, error };
+      }
+    },
+  );
+
+  ipcMain.handle(IPC.discardSkillPreview, (_event, sessionId: string, previewId?: string) => {
+    if (!isValidSessionId(sessionId)) return { ok: false, error: "Unknown session." };
+    if (previewId !== undefined && typeof previewId !== "string") {
+      return { ok: false, error: "Invalid skill preview." };
+    }
+    builder.discardPreview(sessionId, previewId);
+    return { ok: true };
+  });
+
+  ipcMain.handle(
     IPC.createSkill,
     async (
       event,
       sessionId: string,
       plan?: SkillPlan,
       placement: SkillPlacement = "install",
+      previewId?: string,
     ): Promise<SkillCreateResult> => {
       if (!isValidSessionId(sessionId)) return { ok: false, error: "Unknown session." };
+      if (placement !== "install" && placement !== "export") {
+        return { ok: false, error: "Unknown skill placement." };
+      }
+      if (previewId !== undefined && typeof previewId !== "string") {
+        return { ok: false, error: "Invalid skill preview." };
+      }
       try {
-        let target: SkillTarget = { kind: "install" };
-        if (placement === "export") {
+        const placed = await builder.create(sessionId, plan, async (): Promise<SkillTarget | null> => {
+          if (placement === "install") return { kind: "install" };
           // Export == download: let the user pick a destination folder; we drop a
           // ready-to-use <name>/SKILL.md inside it. A dismissed dialog is a cancel, not an error.
           const win = BrowserWindow.fromWebContents(event.sender) ?? undefined;
@@ -451,15 +482,16 @@ export function registerIpc(
           const result = win
             ? await dialog.showOpenDialog(win, opts)
             : await dialog.showOpenDialog(opts);
-          if (result.canceled || result.filePaths.length === 0) return { ok: false, canceled: true };
-          target = { kind: "export", dir: result.filePaths[0] };
-        }
-        const { skill, path: file } = await builder.create(sessionId, plan, target);
+          if (result.canceled || result.filePaths.length === 0) return null;
+          return { kind: "export", dir: result.filePaths[0] };
+        }, previewId);
+        if (!placed) return { ok: false, canceled: true };
+        const { skill, path: file } = placed;
         return { ok: true, skill, path: file, placement };
       } catch (err) {
         const error = err instanceof Error ? err.message : String(err);
         log.warn("create skill failed:", error);
-        return { ok: false, error };
+        return { ok: false, error, previewExpired: err instanceof SkillPreviewExpiredError };
       }
     },
   );

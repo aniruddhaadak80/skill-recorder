@@ -206,9 +206,23 @@ export interface SkillPlanResult {
  */
 export type SkillPlacement = TargetPlacement;
 
+/** Exact rendered file held in the main process until placement or discard. */
+export interface SkillPreview {
+  id: string;
+  markdown: string;
+}
+
+export interface SkillPreviewResult {
+  ok: boolean;
+  preview?: SkillPreview;
+  error?: string;
+}
+
 /** Result of finalizing + placing a skill. */
 export interface SkillCreateResult {
   ok: boolean;
+  /** The reviewed candidate was discarded or no longer matches the plan. */
+  previewExpired?: boolean;
   skill?: BuiltSkill;
   /** Absolute path of the placed SKILL.md. */
   path?: string;
@@ -475,6 +489,8 @@ export const IPC = {
   deleteSession: "sessions:delete",
   exportDebugBundle: "sessions:export-debug",
   buildSkill: "skill:build",
+  prepareSkill: "skill:prepare",
+  discardSkillPreview: "skill:discard-preview",
   createSkill: "skill:create",
   getSkill: "skill:get",
   cancelSkill: "skill:cancel",
@@ -602,7 +618,14 @@ export interface SkillRecorderApi {
    * skills folder (Scout); `"export"` prompts for a folder and downloads it there (the
    * only option for Cowork). Defaults to `"install"`.
    */
-  createSkill(sessionId: string, plan: SkillPlan, placement?: SkillPlacement): Promise<SkillCreateResult>;
+  prepareSkill(sessionId: string, plan: SkillPlan): Promise<SkillPreviewResult>;
+  discardSkillPreview(sessionId: string, previewId?: string): Promise<{ ok: boolean; error?: string }>;
+  createSkill(
+    sessionId: string,
+    plan: SkillPlan,
+    placement?: SkillPlacement,
+    previewId?: string,
+  ): Promise<SkillCreateResult>;
   /** Load a previously built skill for a session, if any. */
   getSkill(sessionId: string): Promise<BuiltSkill | null>;
   /** Abort an in-flight build. */
