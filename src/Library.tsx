@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 
 import type { Analysis, AnalysisStep } from "../common/analysis";
 import type {
@@ -10,6 +10,7 @@ import type {
   SessionSummary,
   SkillBuildProgress,
   SkillPlacement,
+  SkillPreview,
 } from "../common/ipc";
 import { isCopilotSignedOutError } from "../common/ipc";
 import type {
@@ -39,6 +40,8 @@ import {
 } from "./plan-edit";
 import { formatBytes, formatDur, formatWhen, shortLabel } from "./format";
 import { skillPlacementModel, skillTargetFor } from "./skill-placement";
+import { SkillReviewModal } from "./SkillReviewModal";
+import { initialSkillReviewState, SkillOperationGuard, skillReviewBusy, skillReviewReducer } from "./skill-review-state";
 import { SensitiveReview } from "./SensitiveReview";
 import { AnalysisRecovery, completeSignIn, type AnalysisRun } from "./analysis-recovery";
 
@@ -1148,35 +1151,78 @@ function SkillBuilderView({
   );
   // If this recording is already a skill, hold on a spinner until we've loaded it,
   // so we never flash the planning state before jumping to the skill.
-  const [phase, setPhase] = useState<BuildPhase>(hasSkill ? "loading" : "ready");
+  const [{ phase, preview, reviewOpen, statusLine, error }, dispatch] = useReducer(
+    skillReviewReducer, hasSkill, initialSkillReviewState,
+  );
   const [architecture, setArchitecture] = useState<SkillArchitecture>(initialArch);
   const [plan, setPlan] = useState<SkillPlan | null>(null);
-  const [statusLine, setStatusLine] = useState("");
-  const [error, setError] = useState<string | null>(null);
   const [exportedPath, setExportedPath] = useState("");
   const [builtName, setBuiltName] = useState("");
-  const canceled = useRef(false);
-  const inFlight = useRef(false);
+  const operations = useRef(new SkillOperationGuard());
+  const flowVersion = useRef(0);
+  const stopping = useRef(false);
+  const mounted = useRef(false);
+  const previewRef = useRef<SkillPreview | null>(null);
+  const workspaceRef = useRef<HTMLElement>(null);
+  const reviewButtonRef = useRef<HTMLButtonElement>(null);
+  const doneRef = useRef<HTMLDivElement>(null);
   const [placement, setPlacement] = useState<SkillPlacement>(() => defaultPlacementFor(initialArch));
   const placementModel = useMemo(() => skillPlacementModel(skillTargetFor(architecture)), [architecture]);
 
+  const discardPreview = useCallback(async (id: string, reportError = false) => {
+    const version = flowVersion.current;
+    try {
+      const result = await window.skillRecorder.discardSkillPreview(sessionId, id);
+      if (!result.ok) throw new Error(result.error ?? "Could not discard the preview");
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      if (reportError && mounted.current && flowVersion.current === version) {
+        dispatch({ type: "error", error: message });
+      }
+      else console.warn("Could not discard skill preview", cause);
+    }
+  }, [sessionId]);
+
+  const invalidatePreview = useCallback(() => {
+    flowVersion.current++;
+    const previous = previewRef.current;
+    previewRef.current = null;
+    dispatch({ type: "invalidate" });
+    if (previous) void discardPreview(previous.id, true);
+  }, [discardPreview]);
+
   const updatePlan = useCallback((part: Partial<SkillPlan>) => {
+    invalidatePreview();
     setPlan((prev) => (prev ? { ...prev, ...part } : prev));
-  }, []);
+  }, [invalidatePreview]);
 
   // Leaving the builder (session switch or Close) discards an in-progress plan —
   // we don't save drafts — so stop any run that's still going in the background.
   useEffect(() => {
+    mounted.current = true;
+    const guard = operations.current;
     return () => {
-      if (inFlight.current) void window.skillRecorder.cancelSkill(sessionId);
+      mounted.current = false;
+      flowVersion.current++;
+      if (guard.invalidate()) {
+        void window.skillRecorder.cancelSkill(sessionId).then((result) => {
+          if (!result.ok) throw new Error("Could not cancel skill work");
+        }).catch((cause: unknown) => {
+          console.warn("Could not cancel skill work on departure", cause);
+        });
+      }
+      const previous = previewRef.current;
+      previewRef.current = null;
+      if (previous) void discardPreview(previous.id);
     };
-  }, [sessionId]);
+  }, [sessionId, discardPreview]);
 
   // Reopen straight to the exported state if this recording already has a skill.
   useEffect(() => {
     let live = true;
+    const version = flowVersion.current;
     void window.skillRecorder.getSkill(sessionId).then((s: BuiltSkill | null) => {
-      if (!live) return;
+      if (!live || flowVersion.current !== version) return;
       if (s?.exportedPath) {
         setBuiltName(s.name);
         setExportedPath(s.exportedPath);
@@ -1185,11 +1231,16 @@ function SkillBuilderView({
         // current default placement from the manifest.
         setPlacement(defaultPlacementFor(s.architecture));
         if (s.plan) setPlan(s.plan);
-        setPhase("done");
+        dispatch({ type: "done" });
       } else if (hasSkill) {
         // We expected a skill but couldn't load it; fall back to the ready screen.
-        setPhase("ready");
+        dispatch({ type: "settle", phase: "ready" });
       }
+    }).catch((cause: unknown) => {
+      if (live && flowVersion.current === version) dispatch({
+        type: "settle", phase: "ready",
+        error: cause instanceof Error ? cause.message : "Could not open the skill",
+      });
     });
     return () => {
       live = false;
@@ -1198,65 +1249,143 @@ function SkillBuilderView({
 
   useEffect(() => {
     return window.skillRecorder.onSkillProgress((p: SkillBuildProgress) => {
-      if (p.sessionId === sessionId) setStatusLine(p.message);
+      if (p.sessionId === sessionId && mounted.current && operations.current.busy && !stopping.current) {
+        dispatch({ type: "progress", message: p.message });
+      }
     });
   }, [sessionId]);
 
   const runPlan = useCallback(async () => {
-    canceled.current = false;
-    inFlight.current = true;
-    setError(null);
-    setStatusLine("Planning the skill…");
-    setPhase("planning");
-    const res = await window.skillRecorder.buildSkill({ sessionId, architecture });
-    inFlight.current = false;
-    if (res.ok && res.plan) {
-      setPlan(res.plan);
-      setPhase("plan");
-    } else if (!canceled.current) {
-      setError(res.error ?? "Planning failed");
-      setPhase("ready");
+    const operation = operations.current.begin();
+    if (!operation) return;
+    invalidatePreview();
+    flowVersion.current++;
+    dispatch({ type: "start", phase: "planning", message: "Planning the skill…" });
+    try {
+      const res = await window.skillRecorder.buildSkill({ sessionId, architecture });
+      if (!mounted.current || !operations.current.isCurrent(operation)) return;
+      if (res.ok && res.plan) {
+        setPlan(res.plan);
+        dispatch({ type: "settle", phase: "plan" });
+      } else {
+        dispatch({ type: "settle", phase: "ready", error: res.error ?? "Planning failed" });
+      }
+    } catch (cause) {
+      if (mounted.current && operations.current.isCurrent(operation)) {
+        dispatch({ type: "settle", phase: "ready", error: cause instanceof Error ? cause.message : "Planning failed" });
+      }
+    } finally {
+      operations.current.finish(operation);
     }
-  }, [sessionId, architecture]);
+  }, [sessionId, architecture, invalidatePreview]);
+
+  const review = useCallback(async () => {
+    if (!plan) return;
+    dispatch({ type: "visibility", open: true });
+    if (previewRef.current) return;
+    const operation = operations.current.begin();
+    if (!operation) return;
+    flowVersion.current++;
+    dispatch({ type: "start", phase: "preparing", message: "Preparing SKILL.md preview…" });
+    try {
+      const res = await window.skillRecorder.prepareSkill(sessionId, plan);
+      if (!mounted.current || !operations.current.isCurrent(operation)) {
+        if (res.preview) void discardPreview(res.preview.id);
+        return;
+      }
+      if (res.ok && res.preview) {
+        previewRef.current = res.preview;
+        dispatch({ type: "preview", preview: res.preview });
+      } else {
+        dispatch({ type: "settle", phase: "plan", error: res.error ?? "Could not prepare the preview" });
+      }
+    } catch (cause) {
+      if (mounted.current && operations.current.isCurrent(operation)) {
+        dispatch({ type: "settle", phase: "plan", error: cause instanceof Error ? cause.message : "Could not prepare the preview" });
+      }
+    } finally {
+      operations.current.finish(operation);
+    }
+  }, [sessionId, plan, discardPreview]);
 
   const place = useCallback(
     async (which: SkillPlacement) => {
       if (!plan) return;
-      canceled.current = false;
-      inFlight.current = true;
-      setError(null);
-      setStatusLine(which === "export" ? "Exporting the skill…" : "Writing the skill…");
-      setPhase("creating");
-      const res = await window.skillRecorder.createSkill(sessionId, plan, which);
-      inFlight.current = false;
-      if (res.ok && res.skill) {
-        setBuiltName(res.skill.name);
-        setExportedPath(res.path ?? res.skill.exportedPath ?? "");
-        setPlacement(res.placement ?? which);
-        setPhase("done");
-      } else if (res.canceled) {
-        // User dismissed the export folder picker — quietly return to the plan.
-        setPhase("plan");
-      } else if (!canceled.current) {
-        setError(res.error ?? "Could not create the skill");
-        setPhase("plan");
+      const operation = operations.current.begin();
+      if (!operation) return;
+      flowVersion.current++;
+      dispatch({ type: "start", phase: "creating", message: which === "export" ? "Exporting the skill…" : "Writing the skill…" });
+      try {
+        const res = await window.skillRecorder.createSkill(sessionId, plan, which, previewRef.current?.id);
+        if (!mounted.current) return;
+        if (res.ok && res.skill) {
+          if (!operations.current.commit(operation)) return;
+          setBuiltName(res.skill.name);
+          setExportedPath(res.path ?? res.skill.exportedPath ?? "");
+          setPlacement(res.placement ?? which);
+          previewRef.current = null;
+          dispatch({ type: "done" });
+        } else {
+          if (!operations.current.isCurrent(operation)) return;
+          // Folder-picker cancellation and placement failures both retain the candidate.
+          // An expired candidate must be reviewed again explicitly, never silently regenerated.
+          if (res.previewExpired) previewRef.current = null;
+          dispatch({
+            type: "settle",
+            phase: "plan",
+            previewExpired: res.previewExpired,
+            error: res.canceled ? undefined : res.error ?? "Could not create the skill",
+          });
+        }
+      } catch (cause) {
+        if (mounted.current && operations.current.isCurrent(operation)) {
+          dispatch({ type: "settle", phase: "plan", error: cause instanceof Error ? cause.message : "Could not create the skill" });
+        }
+      } finally {
+        operations.current.finish(operation);
       }
     },
     [sessionId, plan],
   );
 
   const cancelRun = useCallback(async () => {
-    canceled.current = true;
-    inFlight.current = false;
-    setStatusLine("Stopping…");
-    await window.skillRecorder.cancelSkill(sessionId);
-    setPhase(plan ? "plan" : "ready");
+    if (stopping.current || !operations.current.busy) return;
+    const cancellation = operations.current.beginCancellation();
+    if (!cancellation) return;
+    stopping.current = true;
+    flowVersion.current++;
+    const { operation, originalSettled } = cancellation;
+    dispatch({ type: "start", phase: "stopping", message: "Stopping…" });
+    let error: string | undefined;
+    try {
+      const res = await window.skillRecorder.cancelSkill(sessionId);
+      if (!res.ok) throw new Error("Could not cancel skill work");
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : "Could not cancel skill work";
+    }
+    // Acknowledging cancellation only marks the backend operation. Its original
+    // request may still own a model turn or an open native folder picker.
+    try {
+      await originalSettled;
+      if (mounted.current && operations.current.isCurrent(operation)) {
+        dispatch({ type: "settle", phase: plan ? "plan" : "ready", error });
+      }
+    } finally {
+      operations.current.finish(operation);
+      stopping.current = false;
+    }
   }, [sessionId, plan]);
 
-  const busy = phase === "planning" || phase === "creating";
+  const restoreReviewFocus = useCallback(() => {
+    if (mounted.current) (doneRef.current ?? reviewButtonRef.current ?? workspaceRef.current)?.focus();
+  }, []);
+  useEffect(() => {
+    if (phase === "done") doneRef.current?.focus();
+  }, [phase]);
+  const busy = skillReviewBusy(phase);
 
   return (
-    <section className="ws">
+    <section className="ws skill-builder" ref={workspaceRef} tabIndex={-1}>
       <div className="ws-head">
         <div className="ws-titles">
           <span className="eyebrow">{phase === "done" ? "Skill" : "Create skill"}</span>
@@ -1292,12 +1421,17 @@ function SkillBuilderView({
         )}
 
         {busy && (
-          <div className="status-line">
+          <div className="status-line" role="status">
             <span className="spinner" />
             <span className="status-text">{statusLine || "Working…"}</span>
-            <button className="linky status-cancel" onClick={cancelRun}>
+            <button className="linky status-cancel" onClick={cancelRun} disabled={phase === "stopping"}>
               Cancel
             </button>
+            {(phase === "preparing" || preview) && (
+              <button className="ghost" ref={reviewButtonRef} onClick={() => dispatch({ type: "visibility", open: true })}>
+                Review SKILL.md
+              </button>
+            )}
           </div>
         )}
 
@@ -1340,7 +1474,7 @@ function SkillBuilderView({
         )}
 
         {phase === "done" && (
-          <div className="sb-done">
+          <div className="sb-done" ref={doneRef} tabIndex={-1}>
             <div className="sb-check" aria-hidden>
               ✓
             </div>
@@ -1362,6 +1496,9 @@ function SkillBuilderView({
         <div className="ws-foot">
           <span className="foot-status" />
           <div className="ws-foot-actions">
+            <button className="ghost" ref={reviewButtonRef} onClick={() => void review()}>
+              Review SKILL.md
+            </button>
             {placementModel.actions.map((action) => (
               <button
                 key={action.placement}
@@ -1387,6 +1524,21 @@ function SkillBuilderView({
             )}
           </div>
         </div>
+      )}
+      {reviewOpen && (
+        <SkillReviewModal
+          preview={preview}
+          busy={busy}
+          stopping={phase === "stopping"}
+          statusLine={statusLine}
+          error={error}
+          placementModel={placementModel}
+          onPlace={(which) => void place(which)}
+          onPrepare={() => void review()}
+          onCancel={() => void cancelRun()}
+          onClose={() => dispatch({ type: "visibility", open: false })}
+          restoreFocus={restoreReviewFocus}
+        />
       )}
     </section>
   );
