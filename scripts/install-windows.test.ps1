@@ -253,7 +253,8 @@ try {
 )
 try {
   [IO.File]::WriteAllText('$escapedReadyFile', 'ready')
-  Start-Sleep -Milliseconds 500
+  # Avoid cold cmdlet discovery extending the lock beyond the retry window.
+  [Threading.Thread]::Sleep(500)
 } finally {
   `$stream.Dispose()
 }
