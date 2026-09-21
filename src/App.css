@@ -2764,6 +2764,46 @@ button:focus-visible,
    Reuses ws / ws-head / ws-foot / status-line / record-cta. The two signature
    moments are the input-source badges and the action → native-tool rows, so
    those carry the only colour; everything else stays quiet sand + neutral. */
+.skill-builder .ws-foot-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.skill-review-sheet {
+  max-width: 920px;
+}
+
+.skill-review-sheet .sheet-head {
+  justify-content: space-between;
+}
+
+.skill-review-source {
+  min-height: 120px;
+  max-height: 55vh;
+  margin: 0;
+  padding: 14px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text);
+  background: var(--deck);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+}
+
+.skill-review-source code {
+  user-select: text;
+}
+
+.skill-review-actions {
+  flex-wrap: wrap;
+  flex-shrink: 0;
+}
+
 .sb-arch {
   display: flex;
   flex-direction: column;
