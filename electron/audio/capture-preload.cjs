@@ -30,8 +30,6 @@ function microphoneConstraints(deviceId) {
   };
 }
 
-
-
 async function enumerateMicrophones() {
   if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return [];
   const devices = await navigator.mediaDevices.enumerateDevices();
